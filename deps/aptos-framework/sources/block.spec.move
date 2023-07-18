@@ -1,18 +1,33 @@
 spec aptos_framework::block {
     spec module {
-        use aptos_std::chain_status;
+        use aptos_framework::chain_status;
         // After genesis, `BlockResource` exist.
         invariant [suspendable] chain_status::is_operating() ==> exists<BlockResource>(@aptos_framework);
     }
 
+    spec BlockResource {
+        invariant epoch_interval > 0;
+    }
+
     spec block_prologue {
         use aptos_framework::chain_status;
+        use aptos_framework::coin::CoinInfo;
+        use aptos_framework::aptos_coin::AptosCoin;
+        use aptos_framework::transaction_fee;
+        use aptos_framework::staking_config;
+
+        pragma verify_duration_estimate = 120; // TODO: set because of timeout (property proved)
+
         requires chain_status::is_operating();
         requires system_addresses::is_vm(vm);
         requires proposer == @vm_reserved || stake::spec_is_current_epoch_validator(proposer);
         requires timestamp >= reconfiguration::last_reconfiguration_time();
         requires (proposer == @vm_reserved) ==> (timestamp::spec_now_microseconds() == timestamp);
         requires (proposer != @vm_reserved) ==> (timestamp::spec_now_microseconds() < timestamp);
+        requires exists<stake::ValidatorFees>(@aptos_framework);
+        requires exists<CoinInfo<AptosCoin>>(@aptos_framework);
+        include transaction_fee::RequiresCollectedFeesPerValueLeqBlockAptosSupply;
+        include staking_config::StakingRewardsConfigRequirement;
 
         aborts_if false;
     }
@@ -49,8 +64,13 @@ spec aptos_framework::block {
     /// Make sure The BlockResource under the caller existed after initializing.
     /// The number of new events created does not exceed MAX_U64.
     spec initialize(aptos_framework: &signer, epoch_interval_microsecs: u64) {
+        use std::signer;
         include Initialize;
         include NewEventHandle;
+
+        let addr = signer::address_of(aptos_framework);
+        let account = global<account::Account>(addr);
+        aborts_if account.guid_creation_num + 2 >= account::MAX_GUID_CREATION_NUM;
     }
 
     spec schema Initialize {
@@ -63,6 +83,7 @@ spec aptos_framework::block {
         aborts_if epoch_interval_microsecs <= 0;
         aborts_if exists<BlockResource>(addr);
         ensures exists<BlockResource>(addr);
+        ensures global<BlockResource>(addr).height == 0;
     }
 
     spec schema NewEventHandle {
