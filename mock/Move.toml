@@ -8,5 +8,5 @@ local = '../deps/aptos-framework'
 [addresses]
 mock = '_'
 
-[dev-addresses]
-mock = '0x77'
+# [dev-addresses]
+# mock = '0x77'

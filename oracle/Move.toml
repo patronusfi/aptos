@@ -16,7 +16,7 @@ local = '../mock'
 switchboard = '_'
 oracle = '_'
 
-[dev-addresses]
-switchboard = '0x55'
-oracle = '0x42'
-mock = '0x77'
+# [dev-addresses]
+# switchboard = '0x55'
+# oracle = '0x42'
+# mock = '0x77'
