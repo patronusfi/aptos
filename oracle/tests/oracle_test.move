@@ -31,9 +31,9 @@ module oracle::oracle_test {
         let adapter = oracle::switchboard_adapter();
 
         oracle::init_test(&oracle);
-        // account::create_account_for_test(signer::address_of(aptos_framework));
-        // block::initialize_for_test(aptos_framework, 1);
-        // timestamp::set_time_has_started_for_testing(aptos_framework);
+        account::create_account_for_test(signer::address_of(aptos_framework));
+        block::initialize_for_test(aptos_framework, 1);
+        timestamp::set_time_has_started_for_testing(aptos_framework);
 
         setup_feed<BTC>(&oracle, @0x100A, C1E9 * 20123, adapter);
         setup_feed<ETH>(&oracle, @0x100B, C1E9 * 1567, adapter);
