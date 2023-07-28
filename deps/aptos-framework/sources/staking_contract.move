@@ -62,6 +62,9 @@ module aptos_framework::staking_contract {
     /// Maximum number of distributions a stake pool can support.
     const MAXIMUM_PENDING_DISTRIBUTIONS: u64 = 20;
 
+    #[resource_group(scope=module_)]
+    struct StakingGroupContainer {}
+
     struct StakingContract has store {
         // Recorded principal after the last commission distribution.
         // This is only used to calculate the commission the operator should be receiving.
@@ -89,6 +92,18 @@ module aptos_framework::staking_contract {
         switch_operator_events: EventHandle<SwitchOperatorEvent>,
         add_distribution_events: EventHandle<AddDistributionEvent>,
         distribute_events: EventHandle<DistributeEvent>,
+    }
+
+    struct UpdateCommissionEvent has drop, store {
+        staker: address,
+        operator: address,
+        old_commission_percentage: u64,
+        new_commission_percentage: u64,
+    }
+
+    #[resource_group_member(group = aptos_framework::staking_contract::StakingGroupContainer)]
+    struct StakingGroupUpdateCommissionEvent has key {
+        update_commission_events: EventHandle<UpdateCommissionEvent>,
     }
 
     struct CreateStakingContractEvent has drop, store {
@@ -150,24 +165,46 @@ module aptos_framework::staking_contract {
         amount: u64,
     }
 
+    #[view]
+    /// Return the address of the underlying stake pool for the staking contract between the provided staker and
+    /// operator.
+    ///
+    /// This errors out the staking contract with the provided staker and operator doesn't exist.
     public fun stake_pool_address(staker: address, operator: address): address acquires Store {
         assert_staking_contract_exists(staker, operator);
         let staking_contracts = &borrow_global<Store>(staker).staking_contracts;
         simple_map::borrow(staking_contracts, &operator).pool_address
     }
 
+    #[view]
+    /// Return the last recorded principal (the amount that 100% belongs to the staker with commission already paid for)
+    /// for staking contract between the provided staker and operator.
+    ///
+    /// This errors out the staking contract with the provided staker and operator doesn't exist.
     public fun last_recorded_principal(staker: address, operator: address): u64 acquires Store {
         assert_staking_contract_exists(staker, operator);
         let staking_contracts = &borrow_global<Store>(staker).staking_contracts;
         simple_map::borrow(staking_contracts, &operator).principal
     }
 
+    #[view]
+    /// Return percentage of accumulated rewards that will be paid to the operator as commission for staking contract
+    /// between the provided staker and operator.
+    ///
+    /// This errors out the staking contract with the provided staker and operator doesn't exist.
     public fun commission_percentage(staker: address, operator: address): u64 acquires Store {
         assert_staking_contract_exists(staker, operator);
         let staking_contracts = &borrow_global<Store>(staker).staking_contracts;
         simple_map::borrow(staking_contracts, &operator).commission_percentage
     }
 
+    #[view]
+    /// Return a tuple of three numbers:
+    /// 1. The total active stake in the underlying stake pool
+    /// 2. The total accumulated rewards that haven't had commission paid out
+    /// 3. The commission amount owned from those accumulated rewards.
+    ///
+    /// This errors out the staking contract with the provided staker and operator doesn't exist.
     public fun staking_contract_amounts(staker: address, operator: address): (u64, u64, u64) acquires Store {
         assert_staking_contract_exists(staker, operator);
         let staking_contracts = &borrow_global<Store>(staker).staking_contracts;
@@ -175,12 +212,18 @@ module aptos_framework::staking_contract {
         get_staking_contract_amounts_internal(staking_contract)
     }
 
+    #[view]
+    /// Return the number of pending distributions (e.g. commission, withdrawals from stakers).
+    ///
+    /// This errors out the staking contract with the provided staker and operator doesn't exist.
     public fun pending_distribution_counts(staker: address, operator: address): u64 acquires Store {
         assert_staking_contract_exists(staker, operator);
         let staking_contracts = &borrow_global<Store>(staker).staking_contracts;
         pool_u64::shareholders_count(&simple_map::borrow(staking_contracts, &operator).distribution_pool)
     }
 
+    #[view]
+    /// Return true if the staking contract between the provided staker and operator exists.
     public fun staking_contract_exists(staker: address, operator: address): bool acquires Store {
         if (!exists<Store>(staker)) {
             return false
@@ -188,6 +231,17 @@ module aptos_framework::staking_contract {
 
         let store = borrow_global<Store>(staker);
         simple_map::contains_key(&store.staking_contracts, &operator)
+    }
+
+    #[view]
+    /// Return the address of the stake pool to be created with the provided staker, operator and seed.
+    public fun get_expected_stake_pool_address(
+        staker: address,
+        operator: address,
+        contract_creation_seed: vector<u8>,
+    ): address {
+        let seed = create_resource_account_seed(staker, operator, contract_creation_seed);
+        account::create_resource_address(&staker, seed)
     }
 
     /// Staker can call this function to create a simple staking contract with a specified operator.
@@ -316,6 +370,37 @@ module aptos_framework::staking_contract {
         stake::increase_lockup_with_cap(&staking_contract.owner_cap);
 
         emit_event(&mut store.reset_lockup_events, ResetLockupEvent { operator, pool_address });
+    }
+
+    /// Convenience function to allow a staker to update the commission percentage paid to the operator.
+    /// TODO: fix the typo in function name. commision -> commission
+    public entry fun update_commision(staker: &signer, operator: address, new_commission_percentage: u64) acquires Store, StakingGroupUpdateCommissionEvent {
+        assert!(
+            new_commission_percentage >= 0 && new_commission_percentage <= 100,
+            error::invalid_argument(EINVALID_COMMISSION_PERCENTAGE),
+        );
+
+        let staker_address = signer::address_of(staker);
+        assert!(exists<Store>(staker_address), error::not_found(ENO_STAKING_CONTRACT_FOUND_FOR_STAKER));
+
+        let store = borrow_global_mut<Store>(staker_address);
+        let staking_contract = simple_map::borrow_mut(&mut store.staking_contracts, &operator);
+        distribute_internal(staker_address, operator, staking_contract, &mut store.distribute_events);
+        request_commission_internal(
+            operator,
+            staking_contract,
+            &mut store.add_distribution_events,
+            &mut store.request_commission_events,
+        );
+        let old_commission_percentage = staking_contract.commission_percentage;
+        staking_contract.commission_percentage = new_commission_percentage;
+        if (!exists<StakingGroupUpdateCommissionEvent>(staker_address)) {
+            move_to(staker, StakingGroupUpdateCommissionEvent { update_commission_events: account::new_event_handle<UpdateCommissionEvent>(staker)})
+        };
+        emit_event(
+            &mut borrow_global_mut<StakingGroupUpdateCommissionEvent>(staker_address).update_commission_events,
+            UpdateCommissionEvent { staker: staker_address, operator, old_commission_percentage, new_commission_percentage }
+        );
     }
 
     /// Unlock commission amount from the stake pool. Operator needs to wait for the amount to become withdrawable
@@ -544,7 +629,7 @@ module aptos_framework::staking_contract {
         }
     }
 
-    // Assert that a staking_contract exists for the staker/operator pair.
+    /// Assert that a staking_contract exists for the staker/operator pair.
     fun assert_staking_contract_exists(staker: address, operator: address) acquires Store {
         assert!(exists<Store>(staker), error::not_found(ENO_STAKING_CONTRACT_FOUND_FOR_STAKER));
         let staking_contracts = &mut borrow_global_mut<Store>(staker).staking_contracts;
@@ -554,7 +639,7 @@ module aptos_framework::staking_contract {
         );
     }
 
-    // Add a new distribution for `recipient` and `amount` to the staking contract's distributions list.
+    /// Add a new distribution for `recipient` and `amount` to the staking contract's distributions list.
     fun add_distribution(
         operator: address,
         staking_contract: &mut StakingContract,
@@ -575,7 +660,7 @@ module aptos_framework::staking_contract {
         );
     }
 
-    // Calculate accumulated rewards and commissions since last update.
+    /// Calculate accumulated rewards and commissions since last update.
     fun get_staking_contract_amounts_internal(staking_contract: &StakingContract): (u64, u64, u64) {
         // Pending_inactive is not included in the calculation because pending_inactive can only come from:
         // 1. Outgoing commissions. This means commission has already been extracted.
@@ -596,13 +681,8 @@ module aptos_framework::staking_contract {
         contract_creation_seed: vector<u8>,
     ): (signer, SignerCapability, OwnerCapability) {
         // Generate a seed that will be used to create the resource account that hosts the staking contract.
-        let seed = bcs::to_bytes(&signer::address_of(staker));
-        vector::append(&mut seed, bcs::to_bytes(&operator));
-        // Include a salt to avoid conflicts with any other modules out there that might also generate
-        // deterministic resource accounts for the same staker + operator addresses.
-        vector::append(&mut seed, SALT);
-        // Add an extra salt given by the staker in case an account with the same address has already been created.
-        vector::append(&mut seed, contract_creation_seed);
+        let seed = create_resource_account_seed(
+            signer::address_of(staker), operator, contract_creation_seed);
 
         let (stake_pool_signer, stake_pool_signer_cap) = account::create_resource_account(staker, seed);
         stake::initialize_stake_owner(&stake_pool_signer, 0, operator, voter);
@@ -629,10 +709,8 @@ module aptos_framework::staking_contract {
         // Charge all stakeholders (except for the operator themselves) commission on any rewards earnt relatively to the
         // previous value of the distribution pool.
         let shareholders = &pool_u64::shareholders(distribution_pool);
-        let len = vector::length(shareholders);
-        let i = 0;
-        while (i < len) {
-            let shareholder = *vector::borrow(shareholders, i);
+        vector::for_each_ref(shareholders, |shareholder| {
+            let shareholder: address = *shareholder;
             if (shareholder != operator) {
                 let shares = pool_u64::shares(distribution_pool, shareholder);
                 let previous_worth = pool_u64::balance(distribution_pool, shareholder);
@@ -645,14 +723,28 @@ module aptos_framework::staking_contract {
                     distribution_pool, unpaid_commission, updated_total_coins);
                 pool_u64::transfer_shares(distribution_pool, shareholder, operator, shares_to_transfer);
             };
-
-            i = i + 1;
-        };
+        });
 
         pool_u64::update_total_coins(distribution_pool, updated_total_coins);
     }
 
-    // Create a new staking_contracts resource.
+    /// Create the seed to derive the resource account address.
+    fun create_resource_account_seed(
+        staker: address,
+        operator: address,
+        contract_creation_seed: vector<u8>,
+    ): vector<u8> {
+        let seed = bcs::to_bytes(&staker);
+        vector::append(&mut seed, bcs::to_bytes(&operator));
+        // Include a salt to avoid conflicts with any other modules out there that might also generate
+        // deterministic resource accounts for the same staker + operator addresses.
+        vector::append(&mut seed, SALT);
+        // Add an extra salt given by the staker in case an account with the same address has already been created.
+        vector::append(&mut seed, contract_creation_seed);
+        seed
+    }
+
+    /// Create a new staking_contracts resource.
     fun new_staking_contracts_holder(staker: &signer): Store {
         Store {
             staking_contracts: simple_map::create<address, StakingContract>(),
@@ -729,7 +821,8 @@ module aptos_framework::staking_contract {
         assert!(last_recorded_principal(staker_address, operator_address) == INITIAL_BALANCE, 0);
 
         // Operator joins the validator set.
-        stake::join_validator_set_for_test(operator, pool_address, true);
+        let (_sk, pk, pop) = stake::generate_identity();
+        stake::join_validator_set_for_test(&pk, &pop, operator, pool_address, true);
         assert!(stake::get_validator_state(pool_address) == VALIDATOR_STATUS_ACTIVE, 1);
 
         // Fast forward to generate rewards.
@@ -825,7 +918,8 @@ module aptos_framework::staking_contract {
         let pool_address = stake_pool_address(staker_address, operator_address);
 
         // Operator joins the validator set.
-        stake::join_validator_set_for_test(operator, pool_address, true);
+        let (_sk, pk, pop) = stake::generate_identity();
+        stake::join_validator_set_for_test(&pk, &pop, operator, pool_address, true);
         assert!(stake::get_validator_state(pool_address) == VALIDATOR_STATUS_ACTIVE, 1);
 
         // Fast forward to generate rewards.
@@ -833,7 +927,7 @@ module aptos_framework::staking_contract {
         let new_balance = with_rewards(INITIAL_BALANCE);
         stake::assert_stake_pool(pool_address, new_balance, 0, 0, 0);
 
-        // Operator tries to request commision multiple times. But their distribution shouldn't change.
+        // Operator tries to request commission multiple times. But their distribution shouldn't change.
         let expected_commission = (new_balance - last_recorded_principal(staker_address, operator_address)) / 10;
         request_commission(operator, staker_address, operator_address);
         assert_distribution(staker_address, operator_address, operator_address, expected_commission);
@@ -852,7 +946,8 @@ module aptos_framework::staking_contract {
         let pool_address = stake_pool_address(staker_address, operator_address);
 
         // Operator joins the validator set.
-        stake::join_validator_set_for_test(operator, pool_address, true);
+        let (_sk, pk, pop) = stake::generate_identity();
+        stake::join_validator_set_for_test(&pk, &pop, operator, pool_address, true);
         assert!(stake::get_validator_state(pool_address) == VALIDATOR_STATUS_ACTIVE, 1);
 
         // Fast forward to generate rewards.
@@ -870,7 +965,7 @@ module aptos_framework::staking_contract {
     }
 
     #[test(aptos_framework = @0x1, staker = @0x123, operator = @0x234)]
-    #[expected_failure(abort_code = 0x80006)]
+    #[expected_failure(abort_code = 0x80006, location = Self)]
     public entry fun test_staker_cannot_create_same_staking_contract_multiple_times(
         aptos_framework: &signer,
         staker: &signer,
@@ -883,7 +978,7 @@ module aptos_framework::staking_contract {
     }
 
     #[test(aptos_framework = @0x1, staker = @0x123, operator = @0x234)]
-    #[expected_failure(abort_code = 0x10002)]
+    #[expected_failure(abort_code = 0x10002, location = Self)]
     public entry fun test_staker_cannot_create_staking_contract_with_invalid_commission(
         aptos_framework: &signer,
         staker: &signer,
@@ -893,7 +988,7 @@ module aptos_framework::staking_contract {
     }
 
     #[test(aptos_framework = @0x1, staker = @0x123, operator = @0x234)]
-    #[expected_failure(abort_code = 0x10001)]
+    #[expected_failure(abort_code = 0x10001, location = Self)]
     public entry fun test_staker_cannot_create_staking_contract_with_less_than_min_stake_required(
         aptos_framework: &signer,
         staker: &signer,
@@ -951,7 +1046,8 @@ module aptos_framework::staking_contract {
 
         // Join validator set and earn some rewards.
         let pool_address = stake_pool_address(staker_address, operator_1_address);
-        stake::join_validator_set_for_test(operator_1, pool_address, true);
+        let (_sk, pk, pop) = stake::generate_identity();
+        stake::join_validator_set_for_test(&pk, &pop, operator_1, pool_address, true);
         stake::end_epoch();
         assert!(stake::get_validator_state(pool_address) == VALIDATOR_STATUS_ACTIVE, 0);
 
@@ -1041,7 +1137,8 @@ module aptos_framework::staking_contract {
         let pool_address = stake_pool_address(staker_address, operator_address);
 
         // Operator joins the validator set so rewards are generated.
-        stake::join_validator_set_for_test(operator, pool_address, true);
+        let (_sk, pk, pop) = stake::generate_identity();
+        stake::join_validator_set_for_test(&pk, &pop, operator, pool_address, true);
         assert!(stake::get_validator_state(pool_address) == VALIDATOR_STATUS_ACTIVE, 1);
 
         // Fast forward to generate rewards.
@@ -1123,7 +1220,8 @@ module aptos_framework::staking_contract {
         let pool_address = stake_pool_address(staker_address, operator_address);
 
         // Operator joins the validator set so rewards are generated.
-        stake::join_validator_set_for_test(operator, pool_address, true);
+        let (_sk, pk, pop) = stake::generate_identity();
+        stake::join_validator_set_for_test(&pk, &pop, operator, pool_address, true);
         assert!(stake::get_validator_state(pool_address) == VALIDATOR_STATUS_ACTIVE, 1);
 
         // Fast forward to generate rewards.
@@ -1157,6 +1255,36 @@ module aptos_framework::staking_contract {
         assert_distribution(staker_address, operator_address, operator_address, unpaid_commission - 1);
         assert_distribution(staker_address, operator_address, staker_address, withdrawn_stake);
         assert!(last_recorded_principal(staker_address, operator_address) == new_balance, 0);
+    }
+    #[test(aptos_framework = @0x1, staker = @0x123, operator = @0x234)]
+    public entry fun test_update_commission(aptos_framework: &signer, staker: &signer, operator: &signer) acquires Store, StakingGroupUpdateCommissionEvent {
+        let initial_balance = INITIAL_BALANCE * 2;
+        setup_staking_contract(aptos_framework, staker, operator, initial_balance, 10);
+        let staker_address = signer::address_of(staker);
+        let operator_address = signer::address_of(operator);
+        let pool_address = stake_pool_address(staker_address, operator_address);
+
+        // Operator joins the validator set so rewards are generated.
+        let (_sk, pk, pop) = stake::generate_identity();
+        stake::join_validator_set_for_test(&pk, &pop, operator, pool_address, true);
+        assert!(stake::get_validator_state(pool_address) == VALIDATOR_STATUS_ACTIVE, 1);
+
+        // Fast forward to generate rewards.
+        stake::end_epoch();
+        let balance_1epoch = with_rewards(initial_balance);
+        let unpaid_commission = (balance_1epoch - initial_balance) / 10;
+        stake::assert_stake_pool(pool_address, balance_1epoch, 0, 0, 0);
+
+        update_commision(staker, operator_address, 5);
+        stake::end_epoch();
+        let balance_2epoch = with_rewards(balance_1epoch - unpaid_commission);
+        stake::assert_stake_pool(pool_address, balance_2epoch, 0, 0, with_rewards(unpaid_commission));
+    }
+
+    #[test(staker = @0xe256f4f4e2986cada739e339895cf5585082ff247464cab8ec56eea726bd2263, operator= @0x9f0a211d218b082987408f1e393afe1ba0c202c6d280f081399788d3360c7f09)]
+    public entry fun test_get_expected_stake_pool_address(staker: address, operator: address) {
+        let pool_address = get_expected_stake_pool_address(staker, operator, vector[0x42, 0x42]);
+        assert!(pool_address == @0x9d9648031ada367c26f7878eb0b0406ae6a969b1a43090269e5cdfabe1b48f0f, 0);
     }
 
     #[test_only]
