@@ -4,7 +4,6 @@ module oracle::oracle_test {
     use aptos_framework::aptos_coin;
     use aptos_framework::timestamp;
     use aptos_framework::block;
-    use aptos_framework::signer;
 
     use switchboard::aggregator::{Self as switchboard_aggregator};
 
@@ -25,15 +24,14 @@ module oracle::oracle_test {
         oracle::update_oracle<CoinType>(oracle, feed, adapter);
     }
 
-    #[test(aptos_framework = @0x1)]
-    public fun setup_oracle(aptos_framework: &signer) {
+    public fun setup_oracle() {
         let oracle = account::create_account_for_test(@oracle);
         let adapter = oracle::switchboard_adapter();
 
         oracle::init_test(&oracle);
-        account::create_account_for_test(signer::address_of(aptos_framework));
-        block::initialize_for_test(aptos_framework, 1);
-        timestamp::set_time_has_started_for_testing(aptos_framework);
+        let aptos = account::create_account_for_test(@0x1);
+        block::initialize_for_test(&aptos, 1);
+        timestamp::set_time_has_started_for_testing(&aptos);
 
         setup_feed<BTC>(&oracle, @0x100A, C1E9 * 20123, adapter);
         setup_feed<ETH>(&oracle, @0x100B, C1E9 * 1567, adapter);
@@ -70,9 +68,9 @@ module oracle::oracle_test {
         };
     }
 
-    #[test(aptos_framework = @0x1)]
-    fun test_update_price(aptos_framework: &signer) {
-        setup_oracle(aptos_framework);
+    #[test]
+    fun test_update_price() {
+        setup_oracle();
 
         assert_price<BTC>(C1E9 * 20123);
         assert_price<ETH>(C1E9 * 1567);
