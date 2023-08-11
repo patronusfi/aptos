@@ -43,6 +43,7 @@ module oracle::oracle_test {
     }
 
     public fun update_price<CoinType>(price: u64) {
+        assert!(price > 0, 0);
         let (feed, adapter) = oracle::lookup(type_of<CoinType>());
         let feed_signer_cap = account::create_test_signer_cap(feed);
         let feed_signer = account::create_signer_with_capability(&feed_signer_cap);
@@ -59,7 +60,7 @@ module oracle::oracle_test {
     }
 
     fun assert_price<CoinType>(price: u64) {
-        let (_feed, adapter) = oracle::lookup(type_of<CoinType>());
+        let (_, adapter) = oracle::lookup(type_of<CoinType>());
         if (adapter == oracle::switchboard_adapter()) {
             let got = oracle::get_price<CoinType>();
             assert!(price == got, 0);
@@ -100,5 +101,20 @@ module oracle::oracle_test {
 
         update_price<aptos_coin::AptosCoin>(C1E9 * 5);
         assert_price<aptos_coin::AptosCoin>(C1E9 * 5);
+    }
+
+    #[test]
+    #[expected_failure]
+    fun test_fail_write_zero_price() {
+        setup_oracle();
+        update_price<USDC>(0);
+    }
+
+    #[test]
+    #[expected_failure]
+    fun test_fail_read_zero_price() {
+        setup_oracle();
+        update_price<USDC>(0);
+        assert_price<USDC>(0);
     }
 }
